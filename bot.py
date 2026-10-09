@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DARKSELF Diamond Manager Bot
-مدیریت الماس، پرداخت کارت‌به‌کارت، گردونه شانس و بازی دوئل
+مدیریت الماس، پرداخت کارت‌به‌کارت، گردونه شانس، بازی دوئل، جوین اجباری
 """
 import asyncio, json, os, re, time, uuid, random, logging, secrets, math
 from datetime import datetime
@@ -10,33 +10,44 @@ from zoneinfo import ZoneInfo
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, Contact
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
-    FloodWait, MessageNotModified, MessageIdInvalid, UserAlreadyParticipant
+    FloodWait, MessageNotModified, MessageIdInvalid,
+    UserNotParticipant, ChatAdminRequired
 )
 from pyrogram.enums import ChatType, ChatMemberStatus
 
-# ═══════════════════════════════════════════
-#                 CONFIG
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                      ⚙️ CONFIG — فقط این ۲ خط رو پر کن
+# ═══════════════════════════════════════════════════════════
+API_ID   = 38187703                                              # ← عدد API_ID خودت (مثال: 1234567)
+API_HASH = "f6533e033ebbed5ad46924af5401e194"                                             # ← رشته API_HASH خودت (مثال: "abcdef123...")
+
+# ═══════════════════════════════════════════════════════════
+#                ✅ بقیه تنظیمات — نیازی به تغییر نیست
+# ═══════════════════════════════════════════════════════════
 BOT_TOKEN     = "8696887400:AAFgfEdEsf4O9Ma-hMRQoFH0NtIYfm-0pe0"
-API_ID        =   38187703                     # ← API_ID خودت رو بذار
-API_HASH      = "f6533e033ebbed5ad46924af5401e194"                      # ← API_HASH خودت رو بذار
 ADMIN_ID      = 8776382159
 CARD_NUMBER   = "6219861435520217"
 CARD_HOLDER   = "تقوی اصل"
-DIAMOND_PRICE = 325                     # تومان برای هر الماس
-SELF_COST_H   = 1                       # هر ساعت سلف = ۱ الماس
-MIN_TOPUP     = 10                      # حداقل شارژ
-MAX_TOPUP     = 5000                    # حداکثر شارژ
-WHEEL_COOLDOWN= 24*3600                 # ۲۴ ساعت
-WHEEL_PRIZES  = [1,1,1,2,2,3,3,5,8,12,20,50]   # توزیع شانس
-DUEL_MIN      = 10                      # حداقل شرط دوئل
+DIAMOND_PRICE = 325                    # تومان برای هر الماس
+SELF_COST_H   = 1                      # هر ساعت سلف = ۱ الماس
+MIN_TOPUP     = 10
+MAX_TOPUP     = 5000
+WHEEL_COOLDOWN= 24 * 3600
+WHEEL_PRIZES  = [1,1,1,2,2,3,3,5,8,12,20,50]
+WHEEL_WEIGHTS = [30,30,15,10,6,4,2,1,1,0.5,0.3,0.2]
+DUEL_MIN      = 10
 DUEL_MAX      = 5000
-DUEL_FEE      = 0.05                    # ۵٪ کمیسیون خانه
-TEHRAN        = ZoneInfo("Asia/Tehran")
+DUEL_FEE      = 0.05
+DUEL_TIMEOUT  = 60
+
+FORCED_CHANNEL     = "cukur_ch_self"
+FORCED_CHANNEL_URL = f"https://t.me/{FORCED_CHANNEL}"
+
+TEHRAN = ZoneInfo("Asia/Tehran")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,16 +56,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("DiamondBot")
 
-# ═══════════════════════════════════════════
-#              STORAGE
-# ═══════════════════════════════════════════
-DATA_FILE = "manager_data.json"
+# ═══════════════════════════════════════════════════════════
+#                       STORAGE
+# ═══════════════════════════════════════════════════════════
+MANAGER_DB = "manager_data.json"
+SELF_DB    = "bot_data.json"
 
 def _default_db():
     return {
-        "users": {},          # uid -> {balance, activated_until, wheel_last, phone, ...}
-        "payments": {},       # pid -> {uid, amount, diamonds, card_photo, receipt, status, ts}
-        "duels": {},          # did -> {creator, amount, created_at, chat_id, msg_id, joined}
+        "users": {},
+        "payments": {},
+        "duels": {},
         "settings": {
             "diamond_price": DIAMOND_PRICE,
             "self_cost_h":   SELF_COST_H,
@@ -62,17 +74,21 @@ def _default_db():
             "card_holder":   CARD_HOLDER,
             "topup_open":    True,
         },
-        "wheel_log": {},      # uid -> [timestamps]
     }
 
 def load_db():
-    if os.path.exists(DATA_FILE):
+    if os.path.exists(MANAGER_DB):
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
+            with open(MANAGER_DB, "r", encoding="utf-8") as f:
                 d = json.load(f)
             base = _default_db()
             for k, v in base.items():
                 d.setdefault(k, v)
+            d["settings"].setdefault("diamond_price", DIAMOND_PRICE)
+            d["settings"].setdefault("self_cost_h", SELF_COST_H)
+            d["settings"].setdefault("card_number", CARD_NUMBER)
+            d["settings"].setdefault("card_holder", CARD_HOLDER)
+            d["settings"].setdefault("topup_open", True)
             return d
         except Exception as e:
             log.error(f"DB load fail: {e}")
@@ -83,12 +99,16 @@ DB_LOCK = asyncio.Lock()
 
 async def save_db():
     async with DB_LOCK:
-        tmp = DATA_FILE + ".tmp"
+        tmp = MANAGER_DB + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(DB, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, DATA_FILE)
+        os.replace(tmp, MANAGER_DB)
+        try:
+            os.chmod(MANAGER_DB, 0o600)
+        except Exception:
+            pass
 
-def get_user(uid: int) -> dict:
+def get_user(uid):
     uid = str(int(uid))
     u = DB["users"].get(uid)
     if not u:
@@ -106,20 +126,21 @@ def get_user(uid: int) -> dict:
             "total_bought": 0,
             "total_spent": 0,
             "self_running": False,
+            "join_verified": False,
         }
         DB["users"][uid] = u
     return u
 
-def upd_user(uid: int, **kw):
+def upd_user(uid, **kw):
     u = get_user(uid)
     u.update(kw)
     return u
 
-def self_seconds_left(uid: int) -> int:
+def self_seconds_left(uid):
     u = get_user(uid)
     return max(0, int(u.get("activated_until", 0) - time.time()))
 
-def fmt_self_left(uid: int) -> str:
+def fmt_self_left(uid):
     s = self_seconds_left(uid)
     if s <= 0:
         return "❌ فعال نیست"
@@ -132,20 +153,17 @@ def fmt_self_left(uid: int) -> str:
     if m and not d: parts.append(f"{m} دقیقه")
     return " | ".join(parts) if parts else "کمتر از ۱ دقیقه"
 
-def now_ts() -> int:
-    return int(time.time())
+def now_ts(): return int(time.time())
+def fmt_money(v): return f"{int(v):,}"
 
-def fmt_money(v: int) -> str:
-    return f"{v:,}"
-
-# ═══════════════════════════════════════════
-#               BOT CLIENT
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       BOT CLIENT
+# ═══════════════════════════════════════════════════════════
 app = Client("diamond_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ═══════════════════════════════════════════
-#            KEYBOARDS
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       KEYBOARDS
+# ═══════════════════════════════════════════════════════════
 def main_menu_kb():
     return ReplyKeyboardMarkup([
         [KeyboardButton("🚀 فعال‌سازی سلف"), KeyboardButton("💎 موجودی")],
@@ -161,32 +179,90 @@ def admin_menu_kb():
         [KeyboardButton("📢 پیام همگانی"),  KeyboardButton("🔙 خروج از پنل")],
     ], resize_keyboard=True)
 
-def back_kb(cb="back_main"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=cb)]])
+# ═══════════════════════════════════════════════════════════
+#                   FORCED JOIN GUARD
+# ═══════════════════════════════════════════════════════════
+async def check_join(uid) -> bool:
+    if uid == ADMIN_ID:
+        return True
+    u = get_user(uid)
+    if u.get("join_verified"):
+        return True
+    try:
+        m = await app.get_chat_member(FORCED_CHANNEL, uid)
+        if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            return False
+        u["join_verified"] = True
+        await save_db()
+        return True
+    except UserNotParticipant:
+        return False
+    except Exception as e:
+        log.warning(f"check_join fail for {uid}: {e}")
+        return False
 
-# ═══════════════════════════════════════════
-#           USER STATES (in-memory)
-# ═══════════════════════════════════════════
-STATES = {}   # uid -> {"step": "...", ...}
+def join_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 عضویت در کانال", url=FORCED_CHANNEL_URL)],
+        [InlineKeyboardButton("✅ عضو شدم", callback_data="check_join")],
+    ])
 
-# ═══════════════════════════════════════════
-#           /start & MAIN MENU
-# ═══════════════════════════════════════════
+async def force_join_msg(m: Message):
+    await m.reply_text(
+        "🔒 **برای استفاده از ربات، ابتدا در کانال ما عضو شوید.**\n\n"
+        f"📢 @{FORCED_CHANNEL}\n\n"
+        "پس از عضویت، روی دکمه «✅ عضو شدم» بزنید.",
+        reply_markup=join_kb()
+    )
+
+# ═══════════════════════════════════════════════════════════
+#                       STATES
+# ═══════════════════════════════════════════════════════════
+STATES = {}
+REG_CLIENTS = {}
+
+# ═══════════════════════════════════════════════════════════
+#                   CHECK JOIN CALLBACK
+# ═══════════════════════════════════════════════════════════
+@app.on_callback_query(filters.regex("^check_join$"))
+async def cb_check_join(c: Client, q: CallbackQuery):
+    uid = q.from_user.id
+    u = get_user(uid)
+    u["join_verified"] = False
+    ok = await check_join(uid)
+    if ok:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.answer("✅ عضویت تأیید شد! حالا می‌تونی استفاده کنی.", show_alert=True)
+        await cmd_start(c, q.message)
+    else:
+        await q.answer("❌ هنوز عضو نشدی! اول عضو شو بعد دکمه رو بزن.", show_alert=True)
+
+# ═══════════════════════════════════════════════════════════
+#                   /start & MAIN MENU
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(c: Client, m: Message):
     uid = m.from_user.id
+
+    if not await check_join(uid):
+        return await force_join_msg(m)
+
     u = get_user(uid)
-    upd_user(uid, name=m.from_user.first_name or "", username=m.from_user.username or "")
+    upd_user(uid, name=m.from_user.first_name or "",
+             username=m.from_user.username or "")
     await save_db()
 
     text = (
         "✦ **𝗗𝗔𝗥𝗞𝗦𝗘𝗟𝗙** ✦\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "به ربات مدیریت سلف خوش اومدی 💎\n\n"
-        f"💎 موجودی فعلی: **{u['balance']}** الماس\n"
-        f"⏱ سلف فعال: **{fmt_self_left(uid)}**\n"
+        f"💎 موجودی: **{u['balance']}** الماس\n"
+        f"⏱ سلف: **{fmt_self_left(uid)}**\n"
         f"💵 هر الماس: **{fmt_money(DB['settings']['diamond_price'])}** تومان\n"
-        f"⚡️ هزینه سلف: **{DB['settings']['self_cost_h']}** الماس در ساعت\n"
+        f"⚡️ هزینه سلف: **{DB['settings']['self_cost_h']}** الماس/ساعت\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "از منوی پایین یکی رو انتخاب کن 👇"
     )
@@ -198,17 +274,16 @@ async def cmd_admin(c: Client, m: Message):
         return await m.reply_text("⛔️ دسترسی ندارید.")
     await m.reply_text("🛠 **پنل مدیریت**", reply_markup=admin_menu_kb())
 
-# ═══════════════════════════════════════════
-#               BALANCE
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       BALANCE
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^💎 موجودی$"))
 async def balance_view(c: Client, m: Message):
     uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     u = get_user(uid)
-    left = self_seconds_left(uid)
     price = DB["settings"]["diamond_price"]
-
-    # estimate hours remaining
     cost_h = DB["settings"]["self_cost_h"]
     hours = u["balance"] // cost_h if cost_h else 0
 
@@ -216,28 +291,30 @@ async def balance_view(c: Client, m: Message):
         "✦ **𝗗𝗔𝗥𝗞𝗦𝗘𝗟𝗙** ✦  ·  WALLET\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"💎 **موجودی الماس:** `{u['balance']}`\n"
-        f"⏱ **سلف فعال تا:** `{fmt_self_left(uid)}`\n"
-        f"⌛️ **با موجودی فعلی:** `{hours}` ساعت دیگر می‌تونی سلف داشته باشی\n"
+        f"⏱ **سلف تا:** `{fmt_self_left(uid)}`\n"
+        f"⌛️ **با موجودی فعلی:** `{hours}` ساعت\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💵 **ارزش موجودی:** `{fmt_money(u['balance']*price)}` تومان\n"
-        f"🛒 **مجموع خرید:** `{fmt_money(u['total_bought'])}` تومان\n"
-        f"📉 **مجموع مصرف:** `{u['total_spent']}` الماس"
+        f"💵 **ارزش:** `{fmt_money(u['balance']*price)}` تومان\n"
+        f"🛒 **خرید کل:** `{fmt_money(u.get('total_bought',0))}` تومان\n"
+        f"📉 **مصرف کل:** `{u.get('total_spent',0)}` الماس"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 شارژ الماس", callback_data="go_topup")],
         [InlineKeyboardButton("🚀 فعال‌سازی سلف", callback_data="go_activate")],
-        [InlineKeyboardButton("🔙 بستن", callback_data="close_msg")],
     ])
     await m.reply_text(text, reply_markup=kb)
 
-# ═══════════════════════════════════════════
-#           TOPUP (شارژ الماس)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       TOPUP
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^💰 شارژ الماس$"))
 async def topup_start(c: Client, m: Message):
+    uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     if not DB["settings"].get("topup_open", True):
         return await m.reply_text("⛔️ شارژ موقتاً بسته است.")
-    STATES[m.from_user.id] = {"step": "topup_amount"}
+    STATES[uid] = {"step": "topup_amount"}
     await m.reply_text(
         "💎 **چند الماس می‌خوای؟**\n"
         f"حداقل `{MIN_TOPUP}` حداکثر `{MAX_TOPUP}`\n\n"
@@ -265,34 +342,28 @@ async def amount_handler(c: Client, m: Message):
 
     price = DB["settings"]["diamond_price"]
     total = amount * price
-
     pid = uuid.uuid4().hex[:12]
     DB["payments"][pid] = {
-        "id": pid,
-        "user_id": uid,
-        "diamonds": amount,
-        "amount_toman": total,
-        "card_photo": None,
-        "receipt": None,
-        "status": "awaiting_card_auth",   # awaiting_card_auth -> awaiting_receipt -> awaiting_admin -> approved/rejected
+        "id": pid, "user_id": uid,
+        "diamonds": amount, "amount_toman": total,
+        "card_photo": None, "receipt": None,
+        "status": "awaiting_card_auth",
         "created_at": now_ts(),
         "user_name": m.from_user.first_name or "",
         "user_username": m.from_user.username or "",
     }
     await save_db()
     STATES[uid] = {"step": "topup_card_auth", "pid": pid}
-
     await m.reply_text(
         "🔐 **احراز هویت پرداخت**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💎 تعداد الماس: `{amount}`\n"
+        f"💎 الماس: `{amount}`\n"
         f"💵 مبلغ: `{fmt_money(total)}` تومان\n\n"
         "برای تأیید، **عکس کارت بانکی به نام خودت** رو بفرست.\n"
-        "این عکس فقط برای مدیریت ارسال می‌شه و بعد از تأیید حذف می‌شود.\n\n"
+        "این عکس فقط برای مدیریت ارسال می‌شه.\n\n"
         "برای لغو: `لغو`"
     )
 
-# ───── card auth photo ─────
 @app.on_message(filters.private & filters.photo, group=5)
 async def photo_handler(c: Client, m: Message):
     uid = m.from_user.id
@@ -304,67 +375,57 @@ async def photo_handler(c: Client, m: Message):
     if step == "topup_card_auth":
         pid = st["pid"]
         p = DB["payments"].get(pid)
-        if not p:
-            return
+        if not p: return
         p["card_photo"] = m.photo.file_id
         p["status"] = "awaiting_receipt"
         await save_db()
         STATES[uid] = {"step": "topup_receipt", "pid": pid}
-
-        price = DB["settings"]["diamond_price"]
-        total = p["diamonds"] * price
+        total = p["diamonds"] * DB["settings"]["diamond_price"]
         s = DB["settings"]
         await m.reply_text(
             "✅ **عکس کارت دریافت شد.**\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"💵 مبلغ قابل واریز: `{fmt_money(total)}` تومان\n\n"
-            "🏦 **اطلاعات کارت مقصد:**\n"
+            f"💵 مبلغ: `{fmt_money(total)}` تومان\n\n"
+            "🏦 **کارت مقصد:**\n"
             f"`{s['card_number']}`\n"
             f"👤 به نام: **{s['card_holder']}**\n\n"
             "پس از واریز، **عکس رسید بانکی** رو بفرست.\n"
             "برای لغو: `لغو`"
         )
-        # notify admin (photo)
         try:
             await app.send_photo(
                 ADMIN_ID, p["card_photo"],
                 caption=(
-                    "🆕 **درخواست شارژ جدید**\n"
-                    f"👤 کاربر: [{p['user_name']}](tg://user?id={uid})\n"
+                    "🆕 **درخواست شارژ**\n"
+                    f"👤 [{p['user_name']}](tg://user?id={uid})\n"
                     f"🆔 `{uid}`\n"
                     f"💎 {p['diamonds']} الماس\n"
                     f"💵 {fmt_money(total)} تومان\n"
-                    f"🔐 PID: `{pid}`"
+                    f"🔐 `{pid}`"
                 ),
             )
         except Exception as e:
-            log.warning(f"notify admin (card) fail: {e}")
+            log.warning(f"notify admin card fail: {e}")
         return
 
     if step == "topup_receipt":
         pid = st["pid"]
         p = DB["payments"].get(pid)
-        if not p:
-            return
+        if not p: return
         p["receipt"] = m.photo.file_id
         p["status"] = "awaiting_admin"
         await save_db()
         STATES.pop(uid, None)
-        await save_db()
-
-        price = DB["settings"]["diamond_price"]
-        total = p["diamonds"] * price
+        total = p["diamonds"] * DB["settings"]["diamond_price"]
         await m.reply_text(
             "⏳ **رسید دریافت شد.**\n"
-            "پس از تأیید مدیریت، الماس‌ها اضافه می‌شوند.\n"
-            "این عملیات معمولاً چند دقیقه طول می‌کشد."
-        , reply_markup=main_menu_kb())
-
-        # send receipt photo + approve buttons to admin
+            "پس از تأیید مدیریت، الماس‌ها اضافه می‌شن.",
+            reply_markup=main_menu_kb()
+        )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ تأیید", callback_data=f"pay_ok:{pid}"),
              InlineKeyboardButton("❌ رد", callback_data=f"pay_no:{pid}")],
-            [InlineKeyboardButton("👤 پروفایل کاربر", callback_data=f"user_info:{uid}")],
+            [InlineKeyboardButton("👤 پروفایل", callback_data=f"user_info:{uid}")],
         ])
         try:
             await app.send_photo(
@@ -378,19 +439,19 @@ async def photo_handler(c: Client, m: Message):
                 reply_markup=kb,
             )
         except Exception as e:
-            log.warning(f"notify admin (receipt) fail: {e}")
+            log.warning(f"notify admin receipt fail: {e}")
         return
 
-# ═══════════════════════════════════════════
-#           SELF ACTIVATION
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                   SELF ACTIVATION
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^🚀 فعال‌سازی سلف$"))
 async def activate_start(c: Client, m: Message):
     uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     u = get_user(uid)
-
     if not u.get("session_string"):
-        # need registration first
         STATES[uid] = {"step": "reg_phone"}
         return await m.reply_text(
             "📱 **ثبت‌نام سلف**\n\n"
@@ -399,8 +460,6 @@ async def activate_start(c: Client, m: Message):
             "برای لغو: `لغو`",
             reply_markup=ReplyKeyboardRemove()
         )
-
-    # existing session → try to activate
     await try_activate(c, m, uid)
 
 async def try_activate(c: Client, m: Message, uid: int):
@@ -413,18 +472,16 @@ async def try_activate(c: Client, m: Message, uid: int):
             "❌ **موجودی کافی نیست.**\n\n"
             f"💎 موجودی: `{u['balance']}` الماس\n"
             f"⚡️ هزینه هر ساعت: `{cost}` الماس\n\n"
-            "برای ادامه سلف، ابتدا شارژ کن.",
+            "ابتدا شارژ کن.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💰 شارژ الماس", callback_data="go_topup")],
             ])
         )
 
-    # estimate how many hours we can prepay
     hours = u["balance"] // cost
     if hours < 1:
         return await m.reply_text("❌ الماس کافی نداری.")
 
-    # Prepay: consume cost * min(hours, 24) up to 24h
     prepay_hours = min(hours, 24)
     cost_total = prepay_hours * cost
     new_balance = u["balance"] - cost_total
@@ -432,54 +489,109 @@ async def try_activate(c: Client, m: Message, uid: int):
 
     upd_user(uid,
              balance=new_balance,
-             activated_until=int(time.time()) + (new_until),
+             activated_until=int(time.time()) + new_until,
              self_running=True,
              total_spent=u.get("total_spent", 0) + cost_total)
     await save_db()
 
-    # TODO: connect to self.py here (send signal / touch shared db)
-    await touch_self_db(uid)
+    ok, err = await touch_self_db(uid)
+    if not ok:
+        return await m.reply_text(
+            f"⚠️ سلف ثبت شد ولی اتصال به self.py ناموفق بود.\n`{err}`\n"
+            "لطفاً به پشتیبانی اطلاع بده."
+        )
 
     await m.reply_text(
         "✅ **سلف فعال شد!**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"⚡️ مدت فعال‌سازی: `{prepay_hours}` ساعت\n"
-        f"💎 الماس مصرفی: `{cost_total}`\n"
+        f"⚡️ مدت: `{prepay_hours}` ساعت\n"
+        f"💎 مصرف: `{cost_total}` الماس\n"
         f"💎 موجودی جدید: `{new_balance}`\n"
         f"⏱ اعتبار: `{fmt_self_left(uid)}`\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "داخل Saved Messages تلگرام خودت دستور `پنل` یا `راهنما` رو بزن.",
+        "🔔 **تا ۲۰ ثانیه دیگه سلف وصل می‌شه.**\n"
+        "داخل Saved Messages تلگرام خودت دستور `پنل` رو بزن.",
         reply_markup=main_menu_kb()
     )
 
 async def touch_self_db(uid: int):
-    """
-    اطلاعات را در دیتابیس self (bot_data.json) می‌نویسد
-    تا فایل self.py که در حال اجرا است، سلف را روشن کند.
-    """
-    SELF_DB = "bot_data.json"
-    if not os.path.exists(SELF_DB):
-        return
     try:
-        with open(SELF_DB, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        u_self = d.setdefault("users", {}).setdefault(str(uid), {})
-        u_self["activation_ready_at"] = 0     # اجازه استارت فوری
+        if os.path.exists(SELF_DB):
+            with open(SELF_DB, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        else:
+            d = {"users": {}, "sessions": {}, "admins": [ADMIN_ID],
+                 "banned_users": [], "invalid_sessions": {}}
+
+        d.setdefault("users", {})
+        d.setdefault("sessions", {})
+        d.setdefault("admins", [ADMIN_ID])
+        d.setdefault("banned_users", [])
+        d.setdefault("invalid_sessions", {})
+
+        u_self = d["users"].setdefault(str(uid), {})
+        m_u = get_user(uid)
+
+        u_self["user_id"] = uid
+        u_self["phone"] = m_u.get("phone", "")
+        u_self["session_string"] = m_u.get("session_string", "")
+        u_self["first_name"] = m_u.get("name", "")
+        u_self["username"] = m_u.get("username", "")
+
+        u_self["activation_ready_at"] = 0
         u_self["activation_id"] = uuid.uuid4().hex
         u_self["activation_notice_pending"] = False
-        u_self["self_active"] = True
+        u_self["activation_failure_notified"] = False
+        u_self["activation_notice_chat"] = uid
+        u_self["last_start_attempt_ts"] = 0
+
         s = u_self.setdefault("settings", {})
         s["self_active"] = True
-        with open(SELF_DB, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
+        s.setdefault("dot_commands", False)
+        s.setdefault("font", "stylized")
+        s.setdefault("clock", False)
+        s.setdefault("clock_manual", False)
+        s.setdefault("secretary", False)
+        s.setdefault("auto_seen", False)
+        s.setdefault("pv_lock", False)
+        s.setdefault("anti_login", False)
+        s.setdefault("anti_delete", False)
+        s.setdefault("anti_edit", False)
+        s.setdefault("enemy_active", False)
+        s.setdefault("friend_active", False)
+        s.setdefault("crash_active", False)
+        s.setdefault("forced_join_active", False)
+        s.setdefault("filter_words_active", False)
+        s.setdefault("tabchi_pv", False)
+        s.setdefault("tabchi_gp", False)
+        s.setdefault("tabchi_smart", False)
+        s.setdefault("avatar", False)
+        s.setdefault("copy_mode", False)
+
+        if m_u.get("phone") and m_u.get("session_string"):
+            d["sessions"][m_u["phone"]] = {
+                "string": m_u["session_string"],
+                "user_id": uid
+            }
+
+        tmp = SELF_DB + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SELF_DB)
+        try:
+            os.chmod(SELF_DB, 0o600)
+        except Exception:
+            pass
+
+        log.info(f"[SELF-DB] activation written for uid={uid}")
+        return True, ""
     except Exception as e:
-        log.warning(f"touch_self_db fail: {e}")
+        log.error(f"touch_self_db fail: {e}")
+        return False, str(e)[:150]
 
-# ═══════════════════════════════════════════
-#           REGISTRATION (phone → code → pass)
-# ═══════════════════════════════════════════
-REG_CLIENTS = {}    # uid -> Client (during login)
-
+# ═══════════════════════════════════════════════════════════
+#                   REGISTRATION
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.text, group=6)
 async def reg_text(c: Client, m: Message):
     uid = m.from_user.id
@@ -501,6 +613,11 @@ async def reg_text(c: Client, m: Message):
         phone = txt.replace(" ", "").replace("-", "")
         if not re.match(r"^\+\d{8,15}$", phone):
             return await m.reply_text("❌ فرمت اشتباه. مثال: `+989121234567`")
+        if not API_ID or not API_HASH:
+            return await m.reply_text(
+                "❌ **خطای سرور:** `API_ID` یا `API_HASH` تنظیم نشده.\n"
+                "به مدیریت اطلاع بده."
+            )
         cl = Client(f"reg_{uid}", api_id=API_ID, api_hash=API_HASH,
                     in_memory=True, no_updates=True)
         try:
@@ -509,7 +626,7 @@ async def reg_text(c: Client, m: Message):
         except FloodWait as fw:
             try: await cl.disconnect()
             except: pass
-            return await m.reply_text(f"⏳ لطفاً {fw.value} ثانیه صبر کن.")
+            return await m.reply_text(f"⏳ {fw.value} ثانیه صبر کن.")
         except Exception as e:
             try: await cl.disconnect()
             except: pass
@@ -518,7 +635,11 @@ async def reg_text(c: Client, m: Message):
         REG_CLIENTS[uid] = cl
         STATES[uid] = {"step": "reg_code", "phone": phone,
                        "hash": sent.phone_code_hash}
-        await m.reply_text("📨 **کد تأیید ارسال شد.**\nکد را با فاصله یا چسبیده بفرست.\nمثال: `1 2 3 4 5`")
+        await m.reply_text(
+            "📨 **کد تأیید ارسال شد.**\n"
+            "کد را با فاصله یا چسبیده بفرست.\n"
+            "مثال: `1 2 3 4 5`"
+        )
 
     elif step == "reg_code":
         cl = REG_CLIENTS.get(uid)
@@ -532,7 +653,7 @@ async def reg_text(c: Client, m: Message):
             STATES[uid] = {"step": "reg_password", "phone": st["phone"]}
             return await m.reply_text("🔐 رمز دو مرحله‌ای را بفرست:")
         except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-            return await m.reply_text(f"❌ کد اشتباه/منقضی. دوباره: `{type(e).__name__}`")
+            return await m.reply_text(f"❌ کد اشتباه/منقضی: `{type(e).__name__}`")
         except Exception as e:
             return await m.reply_text(f"❌ خطا: `{str(e)[:120]}`")
         await finish_reg(c, m, uid, cl)
@@ -553,7 +674,7 @@ async def finish_reg(c: Client, m: Message, uid: int, cl: Client):
         me = await cl.get_me()
         s_str = await cl.export_session_string()
     except Exception as e:
-        return await m.reply_text(f"❌ خطا در خروجی نشست: `{e}`")
+        return await m.reply_text(f"❌ خطا در خروجی: `{e}`")
     finally:
         try: await cl.disconnect()
         except: pass
@@ -565,8 +686,9 @@ async def finish_reg(c: Client, m: Message, uid: int, cl: Client):
     await save_db()
     STATES.pop(uid, None)
 
-    # also save into self.py db so self can use it
-    await save_session_to_self_db(uid, phone, s_str)
+    ok, err = await save_session_to_self_db(uid, phone, s_str)
+    if not ok:
+        log.warning(f"save_session_to_self_db fail: {err}")
 
     await m.reply_text(
         "✅ **ثبت‌نام کامل شد.**\n\n"
@@ -577,31 +699,48 @@ async def finish_reg(c: Client, m: Message, uid: int, cl: Client):
     )
 
 async def save_session_to_self_db(uid: int, phone: str, s_str: str):
-    SELF_DB = "bot_data.json"
     try:
         if os.path.exists(SELF_DB):
             with open(SELF_DB, "r", encoding="utf-8") as f:
                 d = json.load(f)
         else:
-            d = {"users": {}, "sessions": {}, "admins": [ADMIN_ID], "banned_users": []}
-        d.setdefault("users", {})[str(uid)] = d.get("users", {}).get(str(uid), {})
-        u = d["users"][str(uid)]
-        u["user_id"] = uid
-        u["phone"] = phone
-        u["session_string"] = s_str
-        u.setdefault("settings", {})["self_active"] = False
-        d.setdefault("sessions", {})[phone] = {"string": s_str, "user_id": uid}
-        with open(SELF_DB, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
+            d = {"users": {}, "sessions": {}, "admins": [ADMIN_ID],
+                 "banned_users": [], "invalid_sessions": {}}
+
+        d.setdefault("users", {})
+        d.setdefault("sessions", {})
+
+        u_self = d["users"].setdefault(str(uid), {})
+        u_self["user_id"] = uid
+        u_self["phone"] = phone
+        u_self["session_string"] = s_str
+        s = u_self.setdefault("settings", {})
+        s["self_active"] = False
+        s.setdefault("dot_commands", False)
+
+        d["sessions"][phone] = {"string": s_str, "user_id": uid}
+
+        tmp = SELF_DB + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SELF_DB)
+        try:
+            os.chmod(SELF_DB, 0o600)
+        except Exception:
+            pass
+        return True, ""
     except Exception as e:
         log.warning(f"save_session_to_self_db fail: {e}")
+        return False, str(e)[:150]
 
-# ═══════════════════════════════════════════
-#           LUCKY WHEEL (گردونه شانس)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       LUCKY WHEEL
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^🎡 گردونه شانس$"))
 async def wheel_start(c: Client, m: Message):
     uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     u = get_user(uid)
     last = u.get("wheel_last", 0)
     diff = now_ts() - last
@@ -614,8 +753,7 @@ async def wheel_start(c: Client, m: Message):
             f"⏳ برگرد در: `{h} ساعت و {mm} دقیقه`",
             reply_markup=main_menu_kb()
         )
-    # simple spin animation
-    msg = await m.reply_text("🎡 **در حال چرخش...**\n\n🌀 Loading...")
+    msg = await m.reply_text("🎡 **در حال چرخش...**\n\n🌀")
     frames = ["🎡", "🌀", "💫", "⭐️", "✨"]
     for i in range(6):
         await asyncio.sleep(0.5)
@@ -624,9 +762,7 @@ async def wheel_start(c: Client, m: Message):
         except MessageNotModified:
             pass
 
-    # weighted pick
-    weights = [30,30,15,10,6,4,2,1,1,0.5,0.3,0.2]
-    prize = random.choices(WHEEL_PRIZES, weights=weights[:len(WHEEL_PRIZES)], k=1)[0]
+    prize = random.choices(WHEEL_PRIZES, weights=WHEEL_WEIGHTS, k=1)[0]
     u["balance"] += prize
     u["wheel_last"] = now_ts()
     await save_db()
@@ -640,56 +776,61 @@ async def wheel_start(c: Client, m: Message):
         "فردا دوباره برگرد ✨"
     )
 
-# ═══════════════════════════════════════════
-#           PROFILE
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       PROFILE
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^👤 پروفایل من$"))
 async def profile_view(c: Client, m: Message):
     uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     u = get_user(uid)
     reg_t = datetime.fromtimestamp(u.get("registered_at", 0), TEHRAN).strftime("%Y/%m/%d")
     text = (
         "👤 **پروفایل شما**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 آیدی: `{uid}`\n"
-        f"📱 شماره: `{u.get('phone') or '—'}`\n"
+        f"🆔 `{uid}`\n"
+        f"📱 `{u.get('phone') or '—'}`\n"
         f"📅 عضویت: `{reg_t}`\n"
         f"💎 موجودی: `{u['balance']}`\n"
         f"⏱ سلف: `{fmt_self_left(uid)}`\n"
         f"🛒 خرید کل: `{fmt_money(u.get('total_bought',0))}` تومان\n"
-        f"📉 مصرف کل: `{u.get('total_spent',0)}` الماس\n"
+        f"📉 مصرف: `{u.get('total_spent',0)}` الماس\n"
         "━━━━━━━━━━━━━━━━━━"
     )
     await m.reply_text(text, reply_markup=main_menu_kb())
 
-# ═══════════════════════════════════════════
-#           HELP
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       HELP
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^📖 راهنما$"))
 async def help_view(c: Client, m: Message):
+    uid = m.from_user.id
+    if not await check_join(uid):
+        return await force_join_msg(m)
     price = DB["settings"]["diamond_price"]
     await m.reply_text(
         "✦ **𝗗𝗔𝗥𝗞𝗦𝗘𝗟𝗙** ✦  ·  HELP\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "🚀 **فعال‌سازی سلف:**\n"
-        "ابتدا شماره‌ت رو ثبت کن، بعد با الماس فعال کن.\n"
+        "شماره‌ت رو ثبت کن، بعد با الماس فعال کن.\n"
         f"⚡️ هزینه: **{DB['settings']['self_cost_h']}** الماس/ساعت\n\n"
         "💎 **شارژ الماس:**\n"
         "کارت‌به‌کارت + ارسال رسید + تأیید مدیریت\n"
         f"💵 هر الماس: **{fmt_money(price)}** تومان\n\n"
         "🎡 **گردونه شانس:**\n"
-        "هر ۲۴ ساعت یکبار رایگان بچرخون و الماس ببر\n\n"
+        "هر ۲۴ ساعت یکبار رایگان بچرخون\n\n"
         "🎮 **بازی الماسی:**\n"
         "داخل گروه ربات رو ادمین کن و بنویس:\n"
         "`بازی 100` → دوئل با شرط ۱۰۰ الماس\n"
-        "هر کسی سریع‌تر دکمه **پیوستن** رو بزنه وارد می‌شه\n"
-        "برنده تصادفی انتخاب می‌شه و برنده الماس می‌گیره\n"
+        "هر کی سریع‌تر دکمه **پیوستن** رو بزنه وارد می‌شه\n"
+        "برنده تصادفی + کمیسیون خانه ۵٪\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
-# ═══════════════════════════════════════════
-#           BETTING GAME (in groups)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       BETTING GAME
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.group & filters.regex(r"^بازی\s+(\d+)$"))
 async def duel_create(c: Client, m: Message):
     amount = int(m.matches[0].group(1))
@@ -698,7 +839,6 @@ async def duel_create(c: Client, m: Message):
     u = get_user(m.from_user.id)
     if u["balance"] < amount:
         return await m.reply_text(f"❌ موجودی کافی نداری. موجودی: {u['balance']}")
-    # reserve stake
     u["balance"] -= amount
     await save_db()
 
@@ -712,7 +852,7 @@ async def duel_create(c: Client, m: Message):
     await save_db()
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔥 پیوستن به دوئل", callback_data=f"duel_join:{did}")
+        InlineKeyboardButton("🔥 پیوستن", callback_data=f"duel_join:{did}")
     ]])
     txt = (
         f"🎮 **دوئل الماسی** 🎮\n"
@@ -722,21 +862,19 @@ async def duel_create(c: Client, m: Message):
         f"🏆 برنده کل: **{int(amount*2*(1-DUEL_FEE))}** الماس\n"
         f"(کمیسیون خانه: {int(DUEL_FEE*100)}٪)\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⏳ ۳۰ ثانیه فرصت داری سریع‌ترین پیوستن رو بزنی!"
+        f"⏳ {DUEL_TIMEOUT} ثانیه فرصت!"
     )
     sent = await m.reply_text(txt, reply_markup=kb)
     DB["duels"][did]["msg_id"] = sent.id
     await save_db()
 
-    # auto-close after 60s
-    asyncio.create_task(duel_timeout(did, 60))
+    asyncio.create_task(duel_timeout_task(did, DUEL_TIMEOUT))
 
-async def duel_timeout(did: str, secs: int):
+async def duel_timeout_task(did: str, secs: int):
     await asyncio.sleep(secs)
     d = DB["duels"].get(did)
     if not d or d["status"] != "open":
         return
-    # refund
     u = get_user(d["creator"])
     u["balance"] += d["amount"]
     d["status"] = "expired"
@@ -761,12 +899,10 @@ async def duel_join(c: Client, q: CallbackQuery):
     if u["balance"] < d["amount"]:
         return await q.answer(f"موجودی کم. نیاز: {d['amount']}", show_alert=True)
 
-    # consume
     u["balance"] -= d["amount"]
     d["status"] = "done"
     await save_db()
 
-    # random winner
     winner_uid = random.choice([d["creator"], q.from_user.id])
     loser_uid = q.from_user.id if winner_uid == d["creator"] else d["creator"]
     prize = int(d["amount"] * 2 * (1 - DUEL_FEE))
@@ -775,14 +911,14 @@ async def duel_join(c: Client, q: CallbackQuery):
     w["balance"] += prize
     await save_db()
 
-    winner_name = "سازنده" if winner_uid == d["creator"] else q.from_user.first_name
+    winner_name = d["creator_name"] if winner_uid == d["creator"] else q.from_user.first_name
     try:
         await q.message.edit_text(
             "🎲 **نتیجه دوئل** 🎲\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"👤 سازنده: `{d['creator']}`\n"
-            f"👤 پیوست‌شده: [{q.from_user.first_name}](tg://user?id={q.from_user.id})\n"
-            f"💎 شرط هر نفر: **{d['amount']}**\n"
+            f"👤 پیوست: [{q.from_user.first_name}](tg://user?id={q.from_user.id})\n"
+            f"💎 شرط: **{d['amount']}**\n"
             f"🏆 **برنده:** `{winner_name}`\n"
             f"💰 جایزه: **{prize}** الماس\n"
             "━━━━━━━━━━━━━━━━━━"
@@ -790,34 +926,27 @@ async def duel_join(c: Client, q: CallbackQuery):
     except Exception:
         pass
     try:
-        await q.answer(f"🎉 برنده شد: {winner_name} | {prize} الماس", show_alert=True)
+        await q.answer(f"🎉 برنده: {winner_name} | {prize} الماس", show_alert=True)
     except Exception:
         pass
     try:
-        await app.send_message(
-            winner_uid, f"🏆 **تبریک!** در دوئل برنده شدی و {prize} الماس بردی."
-        )
+        await app.send_message(winner_uid,
+            f"🏆 **تبریک!** {prize} الماس بردی.")
     except Exception:
         pass
     try:
-        await app.send_message(
-            loser_uid, f"💔 اینبار باختی. {d['amount']} الماس از دست دادی."
-        )
+        await app.send_message(loser_uid,
+            f"💔 اینبار باختی. {d['amount']} الماس از دست دادی.")
     except Exception:
         pass
 
-# ═══════════════════════════════════════════
-#           CALLBACK ROUTER
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                   CALLBACK ROUTER
+# ═══════════════════════════════════════════════════════════
 @app.on_callback_query()
 async def cb_router(c: Client, q: CallbackQuery):
     data = q.data or ""
     uid = q.from_user.id
-
-    if data == "close_msg":
-        try: await q.message.delete()
-        except: pass
-        return await q.answer()
 
     if data == "go_topup":
         STATES[uid] = {"step": "topup_amount"}
@@ -842,15 +971,13 @@ async def cb_router(c: Client, q: CallbackQuery):
         u["total_bought"] = u.get("total_bought", 0) + p["amount_toman"]
         await save_db()
         try:
-            await q.message.edit_caption(
-                (q.message.caption or "") + "\n\n✅ **تأیید شد.**"
-            )
+            await q.message.edit_caption((q.message.caption or "") + "\n\n✅ **تأیید شد.**")
         except Exception: pass
         try:
             await app.send_message(
                 p["user_id"],
-                f"✅ **پرداخت تأیید شد!**\n\n💎 {p['diamonds']} الماس به موجودی‌ت اضافه شد.\n"
-                f"💎 موجودی جدید: `{u['balance']}`"
+                f"✅ **پرداخت تأیید شد!**\n\n💎 {p['diamonds']} الماس اضافه شد.\n"
+                f"💎 موجودی: `{u['balance']}`"
             )
         except Exception: pass
         return await q.answer("تأیید شد.", show_alert=True)
@@ -865,15 +992,11 @@ async def cb_router(c: Client, q: CallbackQuery):
         p["status"] = "rejected"
         await save_db()
         try:
-            await q.message.edit_caption(
-                (q.message.caption or "") + "\n\n❌ **رد شد.**"
-            )
+            await q.message.edit_caption((q.message.caption or "") + "\n\n❌ **رد شد.**")
         except Exception: pass
         try:
-            await app.send_message(
-                p["user_id"],
-                "❌ **پرداخت رد شد.**\nاگر مطمئنی اشتباهی رخ داده، با پشتیبانی تماس بگیر."
-            )
+            await app.send_message(p["user_id"],
+                "❌ **پرداخت رد شد.** با پشتیبانی تماس بگیر.")
         except Exception: pass
         return await q.answer("رد شد.", show_alert=True)
 
@@ -883,27 +1006,26 @@ async def cb_router(c: Client, q: CallbackQuery):
         tuid = int(data.split(":")[1])
         u = get_user(tuid)
         return await q.answer(
-            f"👤 {u.get('name')}\n"
-            f"🆔 {tuid}\n💎 {u['balance']}\n"
+            f"👤 {u.get('name')}\n🆔 {tuid}\n💎 {u['balance']}\n"
             f"🛒 خرید: {fmt_money(u.get('total_bought',0))}",
             show_alert=True
         )
 
     await q.answer()
 
-# ═══════════════════════════════════════════
-#           ADMIN PANEL
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                   ADMIN PANEL
+# ═══════════════════════════════════════════════════════════
 @app.on_message(filters.private & filters.regex("^📥 صف پرداخت$") & filters.user(ADMIN_ID))
 async def admin_payments(c: Client, m: Message):
     pending = [p for p in DB["payments"].values() if p["status"] == "awaiting_admin"]
     if not pending:
         return await m.reply_text("✅ صف خالیه.")
-    await m.reply_text(f"📥 **{len(pending)} درخواست در انتظار**")
+    await m.reply_text(f"📥 **{len(pending)} درخواست**")
     for p in pending[:20]:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تأیید", callback_data=f"pay_ok:{p['id']}"),
-             InlineKeyboardButton("❌ رد", callback_data=f"pay_no:{p['id']}")],
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ تأیید", callback_data=f"pay_ok:{p['id']}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"pay_no:{p['id']}")],
         ])
         cap = (
             f"👤 {p.get('user_name')} | `{p['user_id']}`\n"
@@ -931,8 +1053,7 @@ async def admin_users(c: Client, m: Message):
         f"⚡️ سلف فعال: `{active}`\n"
         f"💎 مجموع موجودی: `{fmt_money(total_bal)}` الماس\n"
         f"💵 ارزش: `{fmt_money(total_bal*DB['settings']['diamond_price'])}` تومان\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🆔 ۱۰ کاربر آخر:\n"
+        "━━━━━━━━━━━━━━━━━━\n🆔 ۱۰ کاربر آخر:\n"
     )
     for u in users[:10]:
         text += f"`{u['user_id']}` | 💎 {u['balance']} | {u.get('name') or '—'}\n"
@@ -944,12 +1065,12 @@ async def admin_stats(c: Client, m: Message):
     total_rev = sum(p["amount_toman"] for p in DB["payments"].values() if p["status"] == "approved")
     pending = sum(1 for p in DB["payments"].values() if p["status"] == "awaiting_admin")
     await m.reply_text(
-        "📊 **آمار کل سیستم**\n"
+        "📊 **آمار کل**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👥 کل کاربران: `{len(DB['users'])}`\n"
-        f"💎 کل پرداخت تأییدشده: `{total_pay}`\n"
+        f"👥 کاربران: `{len(DB['users'])}`\n"
+        f"💎 پرداخت تأییدشده: `{total_pay}`\n"
         f"⏳ در انتظار: `{pending}`\n"
-        f"💵 درآمد کل: `{fmt_money(total_rev)}` تومان\n"
+        f"💵 درآمد: `{fmt_money(total_rev)}` تومان\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -975,7 +1096,7 @@ async def cb_settings(c: Client, q: CallbackQuery):
         await save_db()
         return await q.answer("تغییر کرد.", show_alert=True)
     STATES[ADMIN_ID] = {"step": f"set_{key}"}
-    await q.message.reply_text(f"مقدار جدید برای **{key}** رو بفرست:")
+    await q.message.reply_text(f"مقدار جدید برای **{key}**:")
     return await q.answer()
 
 @app.on_message(filters.private & filters.user(ADMIN_ID), group=7)
@@ -1002,9 +1123,10 @@ async def admin_set_handler(c: Client, m: Message):
 @app.on_message(filters.private & filters.regex("^📢 پیام همگانی$") & filters.user(ADMIN_ID))
 async def admin_broadcast(c: Client, m: Message):
     STATES[ADMIN_ID] = {"step": "broadcast"}
-    await m.reply_text("پیام (متن/عکس/ویدیو) رو بفرست. برای لغو: `لغو`")
+    await m.reply_text("پیام رو بفرست. برای لغو: `لغو`")
 
-@app.on_message(filters.private & filters.user(ADMIN_ID) & ~filters.command("start") & ~filters.command("admin"), group=8)
+@app.on_message(filters.private & filters.user(ADMIN_ID) &
+                ~filters.command("start") & ~filters.command("admin"), group=8)
 async def admin_broadcast_send(c: Client, m: Message):
     st = STATES.get(ADMIN_ID)
     if not st or st.get("step") != "broadcast":
@@ -1029,15 +1151,10 @@ async def admin_broadcast_send(c: Client, m: Message):
 async def admin_exit(c: Client, m: Message):
     await m.reply_text("خارج شدی.", reply_markup=main_menu_kb())
 
-# ═══════════════════════════════════════════
-#           BILLING LOOP (هر دقیقه)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                   BILLING LOOP
+# ═══════════════════════════════════════════════════════════
 async def billing_loop():
-    """
-    هر 60 ثانیه یکبار:
-    - برای هر کاربر با سلف فعال، 1/60 هزینه ساعت رو کسر می‌کنه
-    - اگر موجودی تموم شد، سلف رو می‌بنده
-    """
     while True:
         try:
             await asyncio.sleep(60)
@@ -1048,18 +1165,13 @@ async def billing_loop():
                 if not u.get("self_running"):
                     continue
                 if self_seconds_left(u["user_id"]) <= 0:
-                    # expired
                     u["self_running"] = False
                     changed = True
                     try:
-                        await app.send_message(
-                            u["user_id"],
-                            "⏰ **زمان سلف تمام شد.** برای ادامه، شارژ کن و دوباره فعال کن."
-                        )
-                    except Exception:
-                        pass
+                        await app.send_message(u["user_id"],
+                            "⏰ **زمان سلف تمام شد.** شارژ کن و دوباره فعال کن.")
+                    except Exception: pass
                     continue
-                # debit
                 u["balance"] = max(0, u["balance"] - cost_min)
                 u["total_spent"] = u.get("total_spent", 0) + cost_min
                 changed = True
@@ -1067,14 +1179,10 @@ async def billing_loop():
                     u["activated_until"] = 0
                     u["self_running"] = False
                     try:
-                        await app.send_message(
-                            u["user_id"],
-                            "❌ **موجودی الماس تموم شد.** سلف متوقف شد."
-                        )
-                    except Exception:
-                        pass
+                        await app.send_message(u["user_id"],
+                            "❌ **موجودی تموم شد.** سلف متوقف شد.")
+                    except Exception: pass
             if changed:
-                # round balances to int for storage
                 for u in DB["users"].values():
                     u["balance"] = int(u["balance"])
                 await save_db()
@@ -1083,10 +1191,20 @@ async def billing_loop():
         except Exception as e:
             log.error(f"billing_loop: {e}")
 
-# ═══════════════════════════════════════════
-#               MAIN
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#                       MAIN
+# ═══════════════════════════════════════════════════════════
 async def main():
+    if not API_ID or not API_HASH:
+        print("\n" + "="*55)
+        print("⚠️  خطا: API_ID و API_HASH خالی هستند!")
+        print("="*55)
+        print("برو داخل فایل bot.py، بالای فایل این دو خط رو پر کن:")
+        print("   API_ID   = 1234567   ← عدد خودت")
+        print('   API_HASH = "abc..."  ← رشته خودت')
+        print("="*55 + "\n")
+        return
+
     await app.start()
     me = await app.get_me()
     log.info(f"Bot started: @{me.username} ({me.id})")
@@ -1097,5 +1215,4 @@ async def main():
     await idle()
 
 if __name__ == "__main__":
-    print("Starting Diamond Manager Bot...")
-    app.run(main())
+    app.run(main())#
