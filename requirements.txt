@@ -1,0 +1,12 @@
+Pyrogram>=2.0.106
+TgCrypto>=1.2.5
+aiohttp
+uvloop; platform_system != "Windows"
+Pillow
+yt-dlp
+jdatetime
+arabic-reshaper
+python-bidi
+psutil
+imageio-ffmpeg
+g4f
