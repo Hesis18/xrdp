@@ -22,8 +22,8 @@ from pyrogram.enums import ChatType, ChatMemberStatus
 #                 CONFIG
 # ═══════════════════════════════════════════
 BOT_TOKEN     = "8696887400:AAFgfEdEsf4O9Ma-hMRQoFH0NtIYfm-0pe0"
-API_ID        = 0                       # ← API_ID خودت رو بذار
-API_HASH      = ""                      # ← API_HASH خودت رو بذار
+API_ID        =   38187703                     # ← API_ID خودت رو بذار
+API_HASH      = "f6533e033ebbed5ad46924af5401e194"                      # ← API_HASH خودت رو بذار
 ADMIN_ID      = 8776382159
 CARD_NUMBER   = "6219861435520217"
 CARD_HOLDER   = "تقوی اصل"
